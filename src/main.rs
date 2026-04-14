@@ -4,186 +4,110 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
 use std::thread;
 
-fn handle_tcp_client(mut stream: TcpStream) -> io::Result<()> {
+fn hex_dump(data: &[u8]) {
+    let mut offset = 0;
+    while offset < data.len() {
+        let chunk = &data[offset..std::cmp::min(offset + 16, data.len())];
+        let hex: Vec<String> = chunk.iter().map(|byte| format!("{:02X}", byte)).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&byte| if byte.is_ascii_graphic() { byte as char } else { '.' })
+            .collect();
+
+        println!("{:08X}  {:<48}  {}", offset, hex.join(" "), ascii);
+        offset += 16;
+    }
+}
+
+fn handle_tcp_client(mut stream: TcpStream, hex_dump_enabled: bool) -> io::Result<()> {
     let mut buffer = String::new();
     let mut reader = io::BufReader::new(&stream);
 
     while reader.read_line(&mut buffer)? > 0 {
-        print!("{}", buffer);
+        if hex_dump_enabled {
+            println!("Received {} bytes from the socket", buffer.len());
+            hex_dump(buffer.as_bytes());
+        } else {
+            print!("{}", buffer);
+        }
+
         stream.write_all(buffer.as_bytes())?;
+
+        if hex_dump_enabled {
+            println!("Sent {} bytes to the socket", buffer.len());
+            hex_dump(buffer.as_bytes());
+        }
+
         buffer.clear();
     }
 
     Ok(())
 }
 
-fn handle_tcp_client_with_process(mut stream: TcpStream, command: &str) -> io::Result<()> {
-    let mut child = Command::new(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let mut child_stdin = child.stdin.take().expect("Failed to open child stdin");
-    let mut child_stdout = child.stdout.take().expect("Failed to open child stdout");
-
-    let stream_clone = stream.try_clone()?;
-
-    // Thread to read from client and write to the process's stdin
-    let input_thread = thread::spawn(move || {
-        let mut reader = io::BufReader::new(stream_clone);
-        let mut buffer = String::new();
-
-        while reader.read_line(&mut buffer).unwrap_or(0) > 0 {
-            if let Err(e) = child_stdin.write_all(buffer.as_bytes()) {
-                eprintln!("Failed to write to child stdin: {}", e);
-                break;
-            }
-            buffer.clear();
-        }
-    });
-
-    // Thread to read from the process's stdout and write to the client
-    let output_thread = thread::spawn(move || {
-        let mut buffer = [0; 1024];
-        loop {
-            match child_stdout.read(&mut buffer) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if let Err(e) = stream.write_all(&buffer[..n]) {
-                        eprintln!("Failed to write to client: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read from child stdout: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    input_thread.join().expect("Input thread panicked");
-    output_thread.join().expect("Output thread panicked");
-
-    Ok(())
-}
-
-fn handle_udp_server(socket: UdpSocket) -> io::Result<()> {
+fn handle_udp_server(socket: UdpSocket, hex_dump_enabled: bool) -> io::Result<()> {
     let mut buffer = [0; 1024];
 
     loop {
         let (size, src) = socket.recv_from(&mut buffer)?; // Receive data from a client
         let received_data = &buffer[..size];
 
-        print!("{}", String::from_utf8_lossy(received_data)); // Print received data
+        if hex_dump_enabled {
+            println!("Received {} bytes from the socket", size);
+            hex_dump(received_data);
+        } else {
+            print!("{}", String::from_utf8_lossy(received_data));
+        }
 
         socket.send_to(received_data, src)?; // Echo data back to the client
-    }
-}
 
-fn scan_ports(host: &str, ports: Vec<u16>, verbose: bool) {
-    for port in ports {
-        let address = format!("{}:{}", host, port);
-        match TcpStream::connect(&address) {
-            Ok(_) => {
-                println!("Connection to {} port {} [tcp] succeeded!", host, port);
-            }
-            Err(_) => {
-                if verbose {
-                    eprintln!("Connection to {} port {} [tcp] failed!", host, port);
-                }
-            }
+        if hex_dump_enabled {
+            println!("Sent {} bytes to the socket", size);
+            hex_dump(received_data);
         }
     }
 }
 
-fn parse_ports(port_arg: &str) -> Vec<u16> {
-    if let Some(range_sep) = port_arg.find('-') {
-        let start = port_arg[..range_sep].parse::<u16>().unwrap_or(0);
-        let end = port_arg[range_sep + 1..].parse::<u16>().unwrap_or(0);
-        (start..=end).collect()
-    } else {
-        vec![port_arg.parse::<u16>().unwrap_or(0)]
-    }
-}
-
-fn main() -> io::Result<()> {
+fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: ccnc -l -p <port> [-u] [-e <command>] | ccnc -z <host> <port-range> [-v]");
-        std::process::exit(1);
+    let mut listen_mode = false;
+    let mut port = 0;
+    let mut hex_dump_enabled = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-l" => listen_mode = true,
+            "-p" => {
+                i += 1;
+                port = args[i].parse().expect("Invalid port number");
+            }
+            "-x" => hex_dump_enabled = true,
+            _ => {}
+        }
+        i += 1;
     }
 
-    if args[1] == "-z" {
-        if args.len() < 4 {
-            eprintln!("Usage: ccnc -z <host> <port-range> [-v]");
-            std::process::exit(1);
-        }
-
-        let host = &args[2];
-        let ports = parse_ports(&args[3]);
-        let verbose = args.len() > 4 && args[4] == "-v";
-
-        scan_ports(host, ports, verbose);
-    } else if args[1] == "-l" {
-        if args.len() < 5 || args[2] != "-p" {
-            eprintln!("Usage: ccnc -l -p <port> [-u] [-e <command>]");
-            std::process::exit(1);
-        }
-
-        let port = &args[3];
+    if listen_mode {
         let address = format!("0.0.0.0:{}", port);
+        let listener = TcpListener::bind(&address).expect("Failed to bind TCP listener");
 
-        if args.len() > 4 && args[4] == "-u" {
-            // UDP server mode
-            let socket = UdpSocket::bind(&address)?;
-            println!("Listening on {} (UDP)...", address);
-            handle_udp_server(socket)?;
-        } else if args.len() > 5 && args[4] == "-e" {
-            // TCP server mode with process execution
-            let command = &args[5];
-            let listener = TcpListener::bind(&address)?;
-            println!("Listening on {} (TCP) and executing '{}'...", address, command);
+        println!("Listening on {}", address);
 
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        thread::spawn(move || {
-                            if let Err(e) = handle_tcp_client_with_process(stream, command) {
-                                eprintln!("Error handling client with process: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Connection failed: {}", e);
-                    }
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let hex_dump_enabled = hex_dump_enabled; // Capture flag for thread
+                    thread::spawn(move || {
+                        if let Err(e) = handle_tcp_client(stream, hex_dump_enabled) {
+                            eprintln!("Error handling client: {}", e);
+                        }
+                    });
                 }
-            }
-        } else {
-            // TCP server mode without process execution
-            let listener = TcpListener::bind(&address)?;
-            println!("Listening on {} (TCP)...", address);
-
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        thread::spawn(move || {
-                            if let Err(e) = handle_tcp_client(stream) {
-                                eprintln!("Error handling client: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Connection failed: {}", e);
-                    }
-                }
+                Err(e) => eprintln!("Failed to accept connection: {}", e),
             }
         }
     } else {
-        eprintln!("Usage: ccnc -l -p <port> [-u] [-e <command>] | ccnc -z <host> <port-range> [-v]");
-        std::process::exit(1);
+        eprintln!("Client mode not implemented in this step.");
     }
-
-    Ok(())
 }
